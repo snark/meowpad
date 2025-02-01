@@ -274,37 +274,9 @@ fn readability(url: &str) -> Result<Article> {
 }
 
 // UTIL
-fn slugify(tag: &str) -> Result<String> {
-    let mut is_sep = true;
-    let mut slug: String = "".to_string();
-    let mut namespace_empty = true;
-    tag.to_lowercase().trim().chars().for_each(|c| {
-        if c.is_alphanumeric() {
-            is_sep = false;
-            namespace_empty = false;
-            slug.push(c);
-        } else if c == ':' {
-            if !is_sep && !namespace_empty {
-                slug.push(':');
-            }
-            is_sep = true;
-            namespace_empty = true;
-        } else {
-            if !is_sep && !namespace_empty {
-                slug.push('-');
-            }
-            is_sep = true;
-        }
-    });
-    if slug.is_empty() {
-        return Err(anyhow!("Invalid tag {}", tag));
-    }
-    Ok(slug)
-}
-
 fn get_tag_id(tx: &Transaction, tag_name: &str) -> Result<TableId> {
     let now = now()?;
-    let slug = slugify(tag_name)?;
+    let slug = util::slugify(tag_name)?;
     let id = db::require_tag(tx, tag_name, &slug, &now)?;
     Ok(id)
 }
@@ -596,5 +568,86 @@ mod db {
         } else {
             Ok(None)
         }
+    }
+}
+
+mod util {
+    use anyhow::{anyhow, Result};
+
+    pub fn slugify(tag: &str) -> Result<String> {
+        let mut is_sep = true;
+        let mut slug: String = "".to_string();
+        tag.to_lowercase().trim().chars().for_each(|c| {
+            if c.is_alphanumeric() {
+                is_sep = false;
+                slug.push(c);
+            } else if c == ':' {
+                slug.push(':');
+            } else if !is_sep {
+                slug.push('-');
+                is_sep = true;
+            }
+        });
+        let mut valid_pieces: Vec<String> = vec![];
+        for piece in slug.split(":") {
+            let s = piece.trim_matches('-');
+            if s.is_empty() {
+                return Err(anyhow!("Invalid tag `{}`", tag));
+            } else {
+                println!("{}", s.to_string());
+                valid_pieces.push(s.to_string());
+            }
+        }
+        if valid_pieces.is_empty() {
+            return Err(anyhow!("Invalid tag `{}`", tag));
+        }
+        Ok(valid_pieces.join(":"))
+    }
+
+    #[test]
+    fn test_slugify() -> Result<()> {
+        let base_case = "Jacques Torneur";
+        assert_eq!(slugify(base_case)?, "jacques-torneur".to_string());
+
+        let alphanumeric = "Excuse 17";
+        assert_eq!(slugify(alphanumeric)?, "excuse-17".to_string());
+
+        let punctuated = "Mr. Bungle";
+        assert_eq!(slugify(punctuated)?, "mr-bungle".to_string());
+
+        let trim_whitespace = " Ursula K. Le Guin ";
+        assert_eq!(slugify(trim_whitespace)?, "ursula-k-le-guin".to_string());
+
+        let namespaced = "ns1:ns2:actual term";
+        assert_eq!(slugify(namespaced)?, "ns1:ns2:actual-term".to_string());
+
+        let trim_interior_whitespace = "  ns1  : ns2 ?: actual term";
+        assert_eq!(
+            slugify(trim_interior_whitespace)?,
+            "ns1:ns2:actual-term".to_string()
+        );
+
+        let invalid_empty = "";
+        assert!(slugify(invalid_empty).is_err());
+
+        let invalid_whitespace_only = "   ";
+        assert!(slugify(invalid_whitespace_only).is_err());
+
+        let invalid_punctuation_only = "???";
+        assert!(slugify(invalid_punctuation_only).is_err());
+
+        let invalid_leading_namespace = ":foo";
+        assert!(slugify(invalid_leading_namespace).is_err());
+
+        let invalid_trailing_namespace = "foo:";
+        assert!(slugify(invalid_trailing_namespace).is_err());
+
+        let invalid_empty_namespace = "foo::bar";
+        assert!(slugify(invalid_empty_namespace).is_err());
+
+        let invalid_whitespace_namespace = "foo: :bar";
+        assert!(slugify(invalid_whitespace_namespace).is_err());
+
+        Ok(())
     }
 }
