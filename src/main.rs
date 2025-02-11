@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use comfy_table::Table;
 use dom_smoothie::{Article, Readability};
 use jiff::{Timestamp, Unit, Zoned};
 use rusqlite::{Connection, Transaction};
@@ -17,6 +18,12 @@ type TableId = Uuid;
 
 static APP_NAME: &str = env!("CARGO_PKG_NAME");
 static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+
+#[derive(Clone, Debug, Default, ValueEnum)]
+enum ListOutputFormat {
+    #[default]
+    Table,
+}
 
 // NB See https://rust-cli-recommendations.sunshowers.io/handling-arguments.html
 // for advice on structuring the subcommands
@@ -60,8 +67,9 @@ impl Default for Config {
 struct Link {
     id: TableId,
     url: Url,
-    title: String,
-    description: String,
+    title: Option<String>,
+    description: Option<String>,
+    content: Option<String>,
     is_primary: bool,
     created_at: Timestamp,
     modified_at: Timestamp,
@@ -107,6 +115,16 @@ struct AddArgs {
 }
 
 #[derive(Parser, Debug, Default)]
+struct ListArgs {
+    /// Format of the output
+    #[arg(long, value_enum, default_value_t=ListOutputFormat::Table)]
+    format: ListOutputFormat,
+    /// Show only links matching one or more tags
+    #[arg(short, long, num_args = 1..)]
+    tag: Vec<String>,
+}
+
+#[derive(Parser, Debug, Default)]
 struct NoteArgs {
     /// Tag for the note; multiple are allowed
     #[arg(short, long, num_args = 1..)]
@@ -125,6 +143,11 @@ enum Commands {
     Add {
         #[clap(flatten)]
         add_args: AddArgs,
+    },
+    #[clap(alias = "ls")]
+    List {
+        #[clap(flatten)]
+        list_args: ListArgs,
     },
     Note {
         #[clap(flatten)]
@@ -160,6 +183,11 @@ fn main() -> Result<()> {
             let tx = conn.transaction()?;
             note_cmd(&tx, note_args).with_context(|| "Unable to add note")?;
             tx.commit()?;
+        }
+        Commands::List { list_args } => {
+            let mut conn = Connection::open(&config.database)?;
+            let tx = conn.transaction()?;
+            list_cmd(&tx, list_args).with_context(|| "Unable to list items")?;
         }
     }
     Ok(())
@@ -352,6 +380,40 @@ fn add_cmd(tx: &Transaction, args: &AddArgs) -> Result<()> {
     Ok(())
 }
 
+fn list_cmd(tx: &Transaction, args: &ListArgs) -> Result<()> {
+    let tags = if args.tag.is_empty() {
+        vec![]
+    } else {
+        args.tag
+            .iter()
+            .map(|t| util::slugify(t))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let items = db::get_links(tx, tags)?;
+    let output = match args.format {
+        ListOutputFormat::Table => list_as_table(items)?,
+    };
+    println!("{output}");
+    Ok(())
+}
+
+fn list_as_table(items: Vec<Link>) -> Result<String> {
+    let mut table = Table::new();
+    table
+        .set_header(vec!["URL", "Title", "Created"])
+        .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
+        .load_preset(comfy_table::presets::UTF8_BORDERS_ONLY)
+        .apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
+    for item in &items {
+        table.add_row(vec![
+            &item.url.to_string(),
+            item.title.as_ref().unwrap_or(&"".to_string()),
+            &item.created_at.strftime("%F").to_string(),
+        ]);
+    }
+    Ok(table.to_string())
+}
+
 fn note_cmd(tx: &Transaction, args: &NoteArgs) -> Result<()> {
     let now = now()?;
     let title = match &args.title {
@@ -389,7 +451,7 @@ fn note_cmd(tx: &Transaction, args: &NoteArgs) -> Result<()> {
 
 mod db {
     use anyhow::{anyhow, Result};
-    use rusqlite::{named_params, Transaction};
+    use rusqlite::{named_params, params_from_iter, Transaction};
     use uuid::Uuid;
 
     type TableId = super::TableId;
@@ -402,6 +464,42 @@ mod db {
     }
 
     // LINKS
+    pub fn get_links(tx: &Transaction, tags: Vec<String>) -> Result<Vec<super::Link>> {
+        let insert = "SELECT
+            id, url, title, description, content, is_primary, created_at, modified_at
+            FROM link
+            ";
+        let where_clause = "WHERE is_primary IS TRUE";
+        let tag_filter = if tags.is_empty() {
+            "".to_string()
+        } else {
+            let qmarks: Vec<&str> = tags.iter().map(|_| "?").collect();
+            let joined = qmarks.join(", ");
+            format!(
+                "AND id in (SELECT link_id FROM item_tag WHERE tag_id in
+            (SELECT id FROM tag WHERE slug IN ({joined})))"
+            )
+        };
+        let order = "ORDER BY created_at DESC";
+        let query = format!("{} {} {} {}", insert, where_clause, tag_filter, order);
+        let mut stmt = tx.prepare(query.as_ref())?;
+        let mut rows = stmt.query(params_from_iter(tags.iter()))?;
+        let mut resp: Vec<super::Link> = vec![];
+        while let Some(row) = rows.next()? {
+            resp.push(super::Link {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                title: Some(row.get::<_, String>(2)?),
+                description: Some(row.get::<_, String>(3)?),
+                content: Some(row.get::<_, String>(4)?),
+                is_primary: row.get(5)?,
+                created_at: row.get::<_, String>(6)?.parse()?,
+                modified_at: row.get::<_, String>(7)?.parse()?,
+            })
+        }
+        Ok(resp)
+    }
+
     pub fn insert_link(
         tx: &Transaction,
         url: &str,
@@ -594,7 +692,6 @@ mod util {
             if s.is_empty() {
                 return Err(anyhow!("Invalid tag `{}`", tag));
             } else {
-                println!("{}", s.to_string());
                 valid_pieces.push(s.to_string());
             }
         }

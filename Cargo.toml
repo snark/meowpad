@@ -19,6 +19,7 @@ rust-version = "1.84.0"
 [dependencies]
 anyhow = "1.0.95"
 clap = { version = "4.5.27", features = ["derive"] }
+comfy-table = "7.1.4"
 dom_smoothie = "0.4.0"
 edit = "0.1.5"
 env_home = "0.1.0"
