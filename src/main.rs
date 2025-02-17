@@ -137,6 +137,15 @@ struct NoteArgs {
     message: Option<String>,
 }
 
+#[derive(Parser, Debug, Default)]
+struct SearchArgs {
+    /// The term to search
+    term: String,
+    /// Format of the output
+    #[arg(long, value_enum, default_value_t=ListOutputFormat::Table)]
+    format: ListOutputFormat,
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Add a link
@@ -152,6 +161,10 @@ enum Commands {
     Note {
         #[clap(flatten)]
         note_args: NoteArgs,
+    },
+    Search {
+        #[clap(flatten)]
+        search_args: SearchArgs,
     },
 }
 
@@ -178,16 +191,21 @@ fn main() -> Result<()> {
             add_cmd(&tx, add_args).with_context(|| format!("Unable to add <{}>", add_args.link))?;
             tx.commit()?;
         }
+        Commands::List { list_args } => {
+            let mut conn = Connection::open(&config.database)?;
+            let tx = conn.transaction()?;
+            list_cmd(&tx, list_args).with_context(|| "Unable to list items")?;
+        }
         Commands::Note { note_args } => {
             let mut conn = Connection::open(&config.database)?;
             let tx = conn.transaction()?;
             note_cmd(&tx, note_args).with_context(|| "Unable to add note")?;
             tx.commit()?;
         }
-        Commands::List { list_args } => {
+        Commands::Search { search_args } => {
             let mut conn = Connection::open(&config.database)?;
             let tx = conn.transaction()?;
-            list_cmd(&tx, list_args).with_context(|| "Unable to list items")?;
+            search_cmd(&tx, search_args).with_context(|| "Unable to search")?;
         }
     }
     Ok(())
@@ -389,7 +407,7 @@ fn list_cmd(tx: &Transaction, args: &ListArgs) -> Result<()> {
             .map(|t| util::slugify(t))
             .collect::<Result<Vec<_>>>()?
     };
-    let items = db::get_links(tx, tags)?;
+    let items = db::get_links(tx, tags, None)?;
     let output = match args.format {
         ListOutputFormat::Table => list_as_table(items)?,
     };
@@ -449,6 +467,16 @@ fn note_cmd(tx: &Transaction, args: &NoteArgs) -> Result<()> {
     Ok(())
 }
 
+fn search_cmd(tx: &Transaction, args: &SearchArgs) -> Result<()> {
+    let search_term = &args.term;
+    let link_items = db::search_links(tx, search_term.as_str())?;
+    let output = match args.format {
+        ListOutputFormat::Table => list_as_table(link_items)?,
+    };
+    println!("{output}");
+    Ok(())
+}
+
 mod db {
     use anyhow::{anyhow, Result};
     use rusqlite::{named_params, params_from_iter, Transaction};
@@ -464,9 +492,13 @@ mod db {
     }
 
     // LINKS
-    pub fn get_links(tx: &Transaction, tags: Vec<String>) -> Result<Vec<super::Link>> {
+    pub fn get_links(
+        tx: &Transaction,
+        tags: Vec<String>,
+        search_term: Option<&str>,
+    ) -> Result<Vec<super::Link>> {
         let insert = "SELECT
-            id, url, title, description, content, is_primary, created_at, modified_at
+            id, url, title, description, is_primary, created_at, modified_at
             FROM link
             ";
         let where_clause = "WHERE is_primary IS TRUE";
@@ -480,10 +512,25 @@ mod db {
             (SELECT id FROM tag WHERE slug IN ({joined})))"
             )
         };
+        let search_filter = if search_term.is_some() {
+            "AND id in (SELECT link_id FROM link_content
+            WHERE link_content MATCH ?)"
+                .to_string()
+        } else {
+            "".to_string()
+        };
         let order = "ORDER BY created_at DESC";
-        let query = format!("{} {} {} {}", insert, where_clause, tag_filter, order);
+        let query = format!(
+            "{} {} {} {} {}",
+            insert, where_clause, tag_filter, search_filter, order
+        );
         let mut stmt = tx.prepare(query.as_ref())?;
-        let mut rows = stmt.query(params_from_iter(tags.iter()))?;
+        let mut all_params = tags;
+        if let Some(term) = search_term {
+            all_params.push(term.to_string());
+        }
+        let query_params = params_from_iter(all_params.iter());
+        let mut rows = stmt.query(query_params)?;
         let mut resp: Vec<super::Link> = vec![];
         while let Some(row) = rows.next()? {
             resp.push(super::Link {
@@ -491,10 +538,12 @@ mod db {
                 url: row.get(1)?,
                 title: Some(row.get::<_, String>(2)?),
                 description: Some(row.get::<_, String>(3)?),
-                content: Some(row.get::<_, String>(4)?),
-                is_primary: row.get(5)?,
-                created_at: row.get::<_, String>(6)?.parse()?,
-                modified_at: row.get::<_, String>(7)?.parse()?,
+                // In the context of a bulk get, we don't need to fetch the
+                // content value at this time.
+                content: None,
+                is_primary: row.get(4)?,
+                created_at: row.get::<_, String>(5)?.parse()?,
+                modified_at: row.get::<_, String>(6)?.parse()?,
             })
         }
         Ok(resp)
@@ -522,8 +571,8 @@ mod db {
             ":modified_at": timestamp,
         };
         let insert = "INSERT INTO link
-            (id, url, title, description, content, is_primary, created_at, modified_at)
-            VALUES(:id, :url, :title, :description, :content, :is_primary, :created_at, :modified_at)
+            (id, url, title, description, is_primary, created_at, modified_at)
+            VALUES(:id, :url, :title, :description, :is_primary, :created_at, :modified_at)
             ";
         // We can't simply "DO NOTHING", because that terminates the query
         // and we don't return an id; instead we'll update something that
@@ -539,11 +588,23 @@ mod db {
         let query = format!("{} {} {}", insert, conflict, returning);
         let mut stmt = tx.prepare(query.as_ref())?;
         let mut rows = stmt.query(values)?;
-        if let Some(row) = rows.next()? {
+        let row_result = if let Some(row) = rows.next()? {
             Ok(row.get(0)?)
         } else {
             Err(anyhow!("Unable to insert link `{}`", url))
+        };
+        // Now, insert the content into the full-text index.
+        if let Ok(row_id) = row_result {
+            let ft_query = "INSERT INTO link_content(link_id, content)
+            VALUES (:id, :content)";
+            let mut ft_stmt = tx.prepare(ft_query)?;
+            let ft_values = named_params! {
+                ":row_id": row_id,
+                ":content": content,
+            };
+            let _ = ft_stmt.query(ft_values)?;
         }
+        row_result
     }
 
     pub fn tag_link(tx: &Transaction, link_id: TableId, tag_id: TableId) -> Result<()> {
@@ -666,6 +727,11 @@ mod db {
         } else {
             Ok(None)
         }
+    }
+
+    // SEARCH
+    pub fn search_links(tx: &Transaction, term: &str) -> Result<Vec<super::Link>> {
+        get_links(tx, vec![], Some(term))
     }
 }
 
