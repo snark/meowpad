@@ -354,12 +354,14 @@ fn add_cmd(tx: &Transaction, args: &AddArgs) -> Result<()> {
 
     let link_id = db::insert_link(
         tx,
-        args.link.as_ref(),
-        title,
-        description,
-        Some(text_content),
-        true,
-        &now,
+        db::LinkInsert {
+            url: args.link.as_ref(),
+            title,
+            description,
+            content: Some(text_content),
+            is_primary: true,
+            timestamp: &now,
+        },
         false,
     )?;
     for tag_name in &args.tag {
@@ -389,8 +391,15 @@ fn add_cmd(tx: &Transaction, args: &AddArgs) -> Result<()> {
     if let Some(related_link) = &args.related_link {
         // TODO: We should I think grab title using Readability, even if we don't
         // need or want description or contents.
-        let related_link_id =
-            db::insert_link(tx, related_link, None, None, None, false, &now, true)?;
+        let insert_vals = db::LinkInsert {
+            url: related_link,
+            title: None,
+            description: None,
+            content: None,
+            is_primary: false,
+            timestamp: &now,
+        };
+        let related_link_id = db::insert_link(tx, insert_vals, true)?;
         db::relate_links(tx, link_id, related_link_id, args.relation.as_deref())?;
     }
 
@@ -549,26 +558,29 @@ mod db {
         Ok(resp)
     }
 
+    pub struct LinkInsert<'a> {
+        pub url: &'a str,
+        pub title: Option<&'a str>,
+        pub description: Option<&'a str>,
+        pub content: Option<&'a str>,
+        pub is_primary: bool,
+        pub timestamp: &'a str,
+    }
+
     pub fn insert_link(
         tx: &Transaction,
-        url: &str,
-        title: Option<&str>,
-        description: Option<&str>,
-        content: Option<&str>,
-        is_primary: bool,
-        timestamp: &str,
+        link: LinkInsert,
         ignore_conflict: bool,
     ) -> Result<TableId> {
         let id = get_uuid();
         let values = named_params! {
             ":id": id,
-            ":url": url,
-            ":title": title,
-            ":description": description,
-            ":content": content,
-            ":is_primary": is_primary,
-            ":created_at": timestamp,
-            ":modified_at": timestamp,
+            ":url": link.url,
+            ":title": link.title,
+            ":description": link.description,
+            ":is_primary": link.is_primary,
+            ":created_at": link.timestamp,
+            ":modified_at": link.timestamp,
         };
         let insert = "INSERT INTO link
             (id, url, title, description, is_primary, created_at, modified_at)
@@ -591,7 +603,7 @@ mod db {
         let row_result = if let Some(row) = rows.next()? {
             Ok(row.get(0)?)
         } else {
-            Err(anyhow!("Unable to insert link `{}`", url))
+            Err(anyhow!("Unable to insert link `{}`", link.url))
         };
         // Now, insert the content into the full-text index.
         if let Ok(row_id) = row_result {
@@ -599,8 +611,8 @@ mod db {
             VALUES (:id, :content)";
             let mut ft_stmt = tx.prepare(ft_query)?;
             let ft_values = named_params! {
-                ":row_id": row_id,
-                ":content": content,
+                ":id": row_id,
+                ":content": link.content,
             };
             let _ = ft_stmt.query(ft_values)?;
         }
