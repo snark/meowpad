@@ -86,6 +86,16 @@ struct Note {
     modified_at: Timestamp,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct Tag {
+    id: TableId,
+    name: String,
+    slug: String,
+    created_at: Timestamp,
+    modified_at: Timestamp,
+}
+
 #[derive(Parser, Debug, Default)]
 struct AddArgs {
     /// The URL to add
@@ -146,6 +156,15 @@ struct SearchArgs {
     format: ListOutputFormat,
 }
 
+#[derive(Parser, Debug, Default)]
+struct ShowArgs {
+    /// The link or note to display in detail
+    term: String,
+    /// Format of the output
+    #[arg(long, value_enum, default_value_t=ListOutputFormat::Table)]
+    format: ListOutputFormat,
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Add a link
@@ -165,6 +184,10 @@ enum Commands {
     Search {
         #[clap(flatten)]
         search_args: SearchArgs,
+    },
+    Show {
+        #[clap(flatten)]
+        show_args: ShowArgs,
     },
 }
 
@@ -206,6 +229,12 @@ fn main() -> Result<()> {
             let mut conn = Connection::open(&config.database)?;
             let tx = conn.transaction()?;
             search_cmd(&tx, search_args).with_context(|| "Unable to search")?;
+        }
+        Commands::Show { show_args } => {
+            let mut conn = Connection::open(&config.database)?;
+            let tx = conn.transaction()?;
+            show_cmd(&tx, show_args)
+                .with_context(|| format!("Unable to show <{}>", show_args.term))?;
         }
     }
     Ok(())
@@ -424,6 +453,42 @@ fn list_cmd(tx: &Transaction, args: &ListArgs) -> Result<()> {
     Ok(())
 }
 
+fn link_as_table(link: Link, tags: Vec<Tag>, note: Option<Note>) -> Result<String> {
+    // TODO: Tags; Note
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
+        .load_preset(comfy_table::presets::UTF8_FULL)
+        .apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS);
+    table.add_row(vec![
+        "Title",
+        link.title.as_ref().unwrap_or(&"".to_string()),
+    ]);
+    table.add_row(vec!["URL", link.url.as_ref()]);
+    table.add_row(vec![
+        "Description",
+        link.description.as_ref().unwrap_or(&"".to_string()),
+    ]);
+    table.add_row(vec![
+        "Added".to_string(),
+        link.created_at.strftime("%F").to_string(),
+    ]);
+    if !tags.is_empty() {
+        table.add_row(vec![
+            "Tags".to_string(),
+            tags.iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ]);
+    }
+    if let Some(note) = note {
+        let content = note.content.as_str().trim();
+        table.add_row(vec!["Note", content]);
+    }
+    Ok(table.to_string())
+}
+
 fn list_as_table(items: Vec<Link>) -> Result<String> {
     let mut table = Table::new();
     table
@@ -486,9 +551,24 @@ fn search_cmd(tx: &Transaction, args: &SearchArgs) -> Result<()> {
     Ok(())
 }
 
+fn show_cmd(tx: &Transaction, args: &ShowArgs) -> Result<()> {
+    let link = db::get_link(tx, args.term.as_str())?;
+    let output = if let Some(link) = link {
+        let tags = db::tags_for_item(tx, &link.id)?;
+        let note = db::get_note_by_link_id(tx, &link.id)?;
+        match args.format {
+            ListOutputFormat::Table => link_as_table(link, tags, note)?,
+        }
+    } else {
+        format!("<{}> not found", args.term).to_string()
+    };
+    println!("{output}");
+    Ok(())
+}
+
 mod db {
     use anyhow::{anyhow, Result};
-    use rusqlite::{named_params, params_from_iter, Transaction};
+    use rusqlite::{named_params, params_from_iter, ToSql, Transaction};
     use uuid::Uuid;
 
     type TableId = super::TableId;
@@ -556,6 +636,39 @@ mod db {
             })
         }
         Ok(resp)
+    }
+
+    pub fn get_link(tx: &Transaction, term: &str) -> Result<Option<super::Link>> {
+        let insert = "SELECT
+            id, url, title, description, is_primary, created_at, modified_at
+            FROM link
+            ";
+        let where_clause = "WHERE is_primary IS TRUE";
+        let id_filter = "AND url = ?";
+        let query = format!("{} {} {}", insert, where_clause, id_filter);
+        let mut stmt = tx.prepare(query.as_ref())?;
+        let mut rows = stmt.query([term])?;
+        if let Some(row) = rows.next()? {
+            let mut link = super::Link {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                title: Some(row.get::<_, String>(2)?),
+                description: Some(row.get::<_, String>(3)?),
+                content: None,
+                is_primary: row.get(4)?,
+                created_at: row.get::<_, String>(5)?.parse()?,
+                modified_at: row.get::<_, String>(6)?.parse()?,
+            };
+            let mut stmt =
+                tx.prepare("SELECT content FROM link_content WHERE link_id = ?".as_ref())?;
+            let mut content_rows = stmt.query([link.id.to_string()])?;
+            if let Some(row) = content_rows.next()? {
+                link.content = row.get(0)?;
+            };
+            Ok(Some(link))
+        } else {
+            Ok(None)
+        }
     }
 
     pub struct LinkInsert<'a> {
@@ -656,6 +769,28 @@ mod db {
     }
 
     // TAGS
+    pub fn tags_for_item(tx: &Transaction, item_id: &TableId) -> Result<Vec<super::Tag>> {
+        let query = "SELECT DISTINCT id, slug, name, created_at, modified_at
+            FROM tag
+            WHERE id IN (
+                SELECT tag_id from item_tag
+                WHERE note_id = ?1 OR link_id = ?2
+            ) ORDER BY slug";
+        let mut stmt = tx.prepare(query)?;
+        let mut rows = stmt.query([&item_id, &item_id])?;
+        let mut tags: Vec<super::Tag> = vec![];
+        while let Some(row) = rows.next()? {
+            tags.push(super::Tag {
+                id: row.get(0)?,
+                slug: row.get(1)?,
+                name: row.get(2)?,
+                created_at: row.get::<_, String>(3)?.parse()?,
+                modified_at: row.get::<_, String>(4)?.parse()?,
+            });
+        }
+        Ok(tags)
+    }
+
     pub fn require_tag(
         tx: &Transaction,
         name: &str,
@@ -719,25 +854,59 @@ mod db {
     }
 
     pub fn get_note_by_title(tx: &Transaction, title: &str) -> Result<Option<super::Note>> {
-        let query = "SELECT id, content, title, link_id, created_at, modified_at
-            FROM note
-            WHERE title = ?1";
-        let mut stmt = tx.prepare(query)?;
-        let mut rows = stmt.query([&title])?;
-        let row0 = rows.next()?;
-        if let Some(row) = row0 {
-            let created_at: String = row.get(4)?;
-            let modified_at: String = row.get(5)?;
-            Ok(Some(super::Note {
-                id: row.get(0)?,
-                content: row.get(1)?,
-                title: row.get(2)?,
-                link_id: row.get(3)?,
-                created_at: created_at.parse()?,
-                modified_at: modified_at.parse()?,
-            }))
+        get_note(tx, None, None, Some(title))
+    }
+
+    pub fn get_note_by_link_id(tx: &Transaction, link_id: &TableId) -> Result<Option<super::Note>> {
+        get_note(tx, None, Some(link_id), None)
+    }
+
+    fn get_note(
+        tx: &Transaction,
+        id: Option<&TableId>,
+        link_id: Option<&TableId>,
+        title: Option<&str>,
+    ) -> Result<Option<super::Note>> {
+        let mut filters: Vec<&str> = vec![];
+        let mut values: Vec<Box<dyn ToSql>> = vec![];
+        if let Some(id) = id {
+            filters.push("id = ?");
+            values.push(Box::new(id));
+        }
+        if let Some(link_id) = link_id {
+            filters.push("link_id = ?");
+            values.push(Box::new(link_id));
+        }
+        if let Some(title) = title {
+            filters.push("title = ?");
+            values.push(Box::new(title.to_string()));
+        }
+        if filters.is_empty() {
+            Err(anyhow!("No filter provided for get_note"))
         } else {
-            Ok(None)
+            let filter = filters.join(" AND ");
+            let query = format!(
+                "SELECT id, content, title, link_id, created_at, modified_at
+            FROM note
+            WHERE {filter}",
+            );
+            let mut stmt = tx.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(values.iter()))?;
+            let row0 = rows.next()?;
+            if let Some(row) = row0 {
+                let created_at: String = row.get(4)?;
+                let modified_at: String = row.get(5)?;
+                Ok(Some(super::Note {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    title: row.get(2)?,
+                    link_id: row.get(3)?,
+                    created_at: created_at.parse()?,
+                    modified_at: modified_at.parse()?,
+                }))
+            } else {
+                Ok(None)
+            }
         }
     }
 
