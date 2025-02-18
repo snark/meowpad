@@ -172,19 +172,23 @@ enum Commands {
         #[clap(flatten)]
         add_args: AddArgs,
     },
+    /// Show all links
     #[clap(alias = "ls")]
     List {
         #[clap(flatten)]
         list_args: ListArgs,
     },
+    /// Add a freeform note
     Note {
         #[clap(flatten)]
         note_args: NoteArgs,
     },
+    /// Full-text search of link contents
     Search {
         #[clap(flatten)]
         search_args: SearchArgs,
     },
+    /// Show link details
     Show {
         #[clap(flatten)]
         show_args: ShowArgs,
@@ -453,7 +457,12 @@ fn list_cmd(tx: &Transaction, args: &ListArgs) -> Result<()> {
     Ok(())
 }
 
-fn link_as_table(link: Link, tags: Vec<Tag>, note: Option<Note>) -> Result<String> {
+fn link_as_table(
+    link: Link,
+    tags: Vec<Tag>,
+    note: Option<Note>,
+    related_links: Vec<(String, Option<String>)>,
+) -> Result<String> {
     // TODO: Tags; Note
     let mut table = Table::new();
     table
@@ -480,6 +489,22 @@ fn link_as_table(link: Link, tags: Vec<Tag>, note: Option<Note>) -> Result<Strin
                 .map(|t| t.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
+        ]);
+    }
+    if !related_links.is_empty() {
+        table.add_row(vec![
+            "See Also".to_string(),
+            related_links
+                .iter()
+                .map(|rl| {
+                    if let Some(relation) = &rl.1 {
+                        format!("{} ({relation})", rl.0)
+                    } else {
+                        rl.0.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
         ]);
     }
     if let Some(note) = note {
@@ -556,8 +581,9 @@ fn show_cmd(tx: &Transaction, args: &ShowArgs) -> Result<()> {
     let output = if let Some(link) = link {
         let tags = db::tags_for_item(tx, &link.id)?;
         let note = db::get_note_by_link_id(tx, &link.id)?;
+        let related_links = db::related_links(tx, &link.id)?;
         match args.format {
-            ListOutputFormat::Table => link_as_table(link, tags, note)?,
+            ListOutputFormat::Table => link_as_table(link, tags, note, related_links)?,
         }
     } else {
         format!("<{}> not found", args.term).to_string()
@@ -766,6 +792,25 @@ mod db {
             related_values,
         )?;
         Ok(())
+    }
+
+    pub fn related_links(
+        tx: &Transaction,
+        primary_id: &TableId,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let query = "SELECT
+            url, related_link.relationship
+            FROM link JOIN related_link
+            ON link.id = related_link.primary_link_id
+            WHERE id = ?
+            ";
+        let mut stmt = tx.prepare(query)?;
+        let mut rows = stmt.query([&primary_id])?;
+        let mut resp: Vec<(String, Option<String>)> = vec![];
+        while let Some(row) = rows.next()? {
+            resp.push((row.get(0)?, row.get(1)?));
+        }
+        Ok(resp)
     }
 
     // TAGS
