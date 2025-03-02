@@ -148,6 +148,12 @@ struct NoteArgs {
 }
 
 #[derive(Parser, Debug, Default)]
+struct RemoveArgs {
+    /// The note or link to remove
+    item: String,
+}
+
+#[derive(Parser, Debug, Default)]
 struct SearchArgs {
     /// The term to search
     term: String,
@@ -182,6 +188,12 @@ enum Commands {
     Note {
         #[clap(flatten)]
         note_args: NoteArgs,
+    },
+    /// Remove a link or note
+    #[clap(alias = "rm")]
+    Remove {
+        #[clap(flatten)]
+        remove_args: RemoveArgs,
     },
     /// Full-text search of link contents
     Search {
@@ -227,6 +239,12 @@ fn main() -> Result<()> {
             let mut conn = Connection::open(&config.database)?;
             let tx = conn.transaction()?;
             note_cmd(&tx, note_args).with_context(|| "Unable to add note")?;
+            tx.commit()?;
+        }
+        Commands::Remove { remove_args } => {
+            let mut conn = Connection::open(&config.database)?;
+            let tx = conn.transaction()?;
+            remove_cmd(&tx, remove_args).with_context(|| "Unable to remove item")?;
             tx.commit()?;
         }
         Commands::Search { search_args } => {
@@ -566,6 +584,26 @@ fn note_cmd(tx: &Transaction, args: &NoteArgs) -> Result<()> {
     Ok(())
 }
 
+fn remove_cmd(tx: &Transaction, args: &RemoveArgs) -> Result<()> {
+    let item = &args.item;
+    let mut which: Vec<&str> = vec![];
+    if let Some(link) = db::get_link(tx, item)? {
+        db::delete_link(tx, &link.id)?;
+        which.push("link");
+    }
+    if let Some(note) = db::get_note_by_title(tx, item)? {
+        db::delete_note(tx, &note.id)?;
+        which.push("note");
+    }
+    if which.is_empty() {
+        println!("<{item}> not found");
+    } else {
+        let message = which.join(" and ");
+        println!("Removed {message} for <{item}>");
+    }
+    Ok(())
+}
+
 fn search_cmd(tx: &Transaction, args: &SearchArgs) -> Result<()> {
     let search_term = &args.term;
     let link_items = db::search_links(tx, search_term.as_str())?;
@@ -695,6 +733,15 @@ mod db {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn delete_link(tx: &Transaction, link_id: &TableId) -> Result<()> {
+        // Our foreign key cascades will clean up related links, associated
+        // notes, and tags -- a possible improvement would be to remove orphaned
+        // tags after this is applied.
+        let delete_query = "DELETE FROM link WHERE id = ?";
+        tx.execute(delete_query, [&link_id])?;
+        Ok(())
     }
 
     pub struct LinkInsert<'a> {
@@ -953,6 +1000,14 @@ mod db {
                 Ok(None)
             }
         }
+    }
+
+    pub fn delete_note(tx: &Transaction, note_id: &TableId) -> Result<()> {
+        // Our foreign key cascades will clean up tags -- a possible improvement
+        // would be to remove orphaned tags after this is applied.
+        let delete_query = "DELETE FROM note WHERE id = ?";
+        tx.execute(delete_query, [&note_id])?;
+        Ok(())
     }
 
     // SEARCH
