@@ -403,18 +403,40 @@ fn add_cmd(tx: &Transaction, args: &AddArgs) -> Result<()> {
     };
     let text_content = page_info.text_content.trim();
 
-    let link_id = db::insert_link(
-        tx,
-        db::LinkInsert {
-            url: args.link.as_ref(),
-            title,
-            description,
-            content: Some(text_content),
-            is_primary: true,
-            timestamp: &now,
-        },
-        false,
-    )?;
+    let link_insert_args = db::LinkInsert {
+        url: args.link.as_ref(),
+        title,
+        description,
+        content: Some(text_content),
+        is_primary: true,
+        timestamp: &now,
+    };
+
+    let link_result = db::insert_link(tx, &link_insert_args, false);
+
+    let link_id = if let Ok(new_link) = link_result {
+        new_link
+    } else {
+        // Let's see if we have an existing *secondary* link that we are changing
+        // to a primary (so it can have its own tags, notes, etc.)
+        let mut secondary_link = db::get_link(
+            tx,
+            db::TermOrId::Term(args.link.as_ref()),
+            db::IsPrimary::SecondaryOnly,
+        )?;
+        if let Some(ref mut secondary_link) = secondary_link {
+            secondary_link.title = link_insert_args.title.map(|s| s.to_string());
+            secondary_link.description = link_insert_args.description.map(|s| s.to_string());
+            secondary_link.is_primary = true;
+            db::update_link(tx, secondary_link)?;
+            // A secondary link should never have attached content.
+            db::insert_content(tx, &secondary_link.id, text_content)?;
+        } else {
+            anyhow::bail!("Unable to insert <{}>; is it a duplicate?", args.link);
+        };
+        secondary_link.unwrap().id
+    };
+
     for tag_name in &args.tag {
         let tag_id = get_tag_id(tx, tag_name)?;
         db::tag_link(tx, link_id, tag_id)?;
@@ -450,7 +472,7 @@ fn add_cmd(tx: &Transaction, args: &AddArgs) -> Result<()> {
             is_primary: false,
             timestamp: &now,
         };
-        let related_link_id = db::insert_link(tx, insert_vals, true)?;
+        let related_link_id = db::insert_link(tx, &insert_vals, true)?;
         db::relate_links(tx, link_id, related_link_id, args.relation.as_deref())?;
     }
 
@@ -481,7 +503,6 @@ fn link_as_table(
     note: Option<Note>,
     related_links: Vec<(String, Option<String>)>,
 ) -> Result<String> {
-    // TODO: Tags; Note
     let mut table = Table::new();
     table
         .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
@@ -587,8 +608,18 @@ fn note_cmd(tx: &Transaction, args: &NoteArgs) -> Result<()> {
 fn remove_cmd(tx: &Transaction, args: &RemoveArgs) -> Result<()> {
     let item = &args.item;
     let mut which: Vec<&str> = vec![];
-    if let Some(link) = db::get_link(tx, item)? {
-        db::delete_link(tx, &link.id)?;
+    if let Some(mut link) = db::get_link(tx, db::TermOrId::Term(item), db::IsPrimary::PrimaryOnly)?
+    {
+        let inverse_relations = db::get_inverse_related_links(tx, &link.id)?;
+        if inverse_relations.is_empty() {
+            db::delete_link(tx, &link.id)?;
+        } else {
+            link.is_primary = false;
+            db::update_link(tx, &link)?;
+            db::delete_item_tags(tx, &link.id)?;
+            db::delete_related_links(tx, Some(&link.id), None)?;
+            db::delete_content(tx, &link.id)?;
+        }
         which.push("link");
     }
     if let Some(note) = db::get_note_by_title(tx, item)? {
@@ -615,7 +646,11 @@ fn search_cmd(tx: &Transaction, args: &SearchArgs) -> Result<()> {
 }
 
 fn show_cmd(tx: &Transaction, args: &ShowArgs) -> Result<()> {
-    let link = db::get_link(tx, args.term.as_str())?;
+    let link = db::get_link(
+        tx,
+        db::TermOrId::Term(args.term.as_str()),
+        db::IsPrimary::PrimaryOnly,
+    )?;
     let output = if let Some(link) = link {
         let tags = db::tags_for_item(tx, &link.id)?;
         let note = db::get_note_by_link_id(tx, &link.id)?;
@@ -637,6 +672,27 @@ mod db {
 
     type TableId = super::TableId;
 
+    #[allow(dead_code)]
+    pub enum IsPrimary {
+        PrimaryOnly,
+        SecondaryOnly,
+        Either,
+    }
+
+    pub enum TermOrId<'a> {
+        Term(&'a str),
+        Id(TableId),
+    }
+
+    impl ToSql for TermOrId<'_> {
+        fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+            match *self {
+                TermOrId::Term(term) => Ok(term.into()),
+                TermOrId::Id(id) => Ok(id.into()),
+            }
+        }
+    }
+
     fn get_uuid() -> Uuid {
         let now = jiff::Timestamp::now();
         // NB: We should grab the microseconds and use them instead of 0.
@@ -650,7 +706,7 @@ mod db {
         tags: Vec<String>,
         search_term: Option<&str>,
     ) -> Result<Vec<super::Link>> {
-        let insert = "SELECT
+        let select = "SELECT
             id, url, title, description, is_primary, created_at, modified_at
             FROM link
             ";
@@ -675,7 +731,7 @@ mod db {
         let order = "ORDER BY created_at DESC";
         let query = format!(
             "{} {} {} {} {}",
-            insert, where_clause, tag_filter, search_filter, order
+            select, where_clause, tag_filter, search_filter, order
         );
         let mut stmt = tx.prepare(query.as_ref())?;
         let mut all_params = tags;
@@ -702,22 +758,33 @@ mod db {
         Ok(resp)
     }
 
-    pub fn get_link(tx: &Transaction, term: &str) -> Result<Option<super::Link>> {
+    pub fn get_link(
+        tx: &Transaction,
+        identifier: TermOrId,
+        is_primary: IsPrimary,
+    ) -> Result<Option<super::Link>> {
         let insert = "SELECT
             id, url, title, description, is_primary, created_at, modified_at
             FROM link
             ";
-        let where_clause = "WHERE is_primary IS TRUE";
-        let id_filter = "AND url = ?";
+        let where_clause = match is_primary {
+            IsPrimary::PrimaryOnly => "WHERE is_primary IS TRUE",
+            IsPrimary::SecondaryOnly => "WHERE is_primary IS FALSE",
+            _ => "WHERE 1 = 1",
+        };
+        let id_filter = match identifier {
+            TermOrId::Term(_) => "AND url = ?",
+            TermOrId::Id(_) => "AND id = ?",
+        };
         let query = format!("{} {} {}", insert, where_clause, id_filter);
         let mut stmt = tx.prepare(query.as_ref())?;
-        let mut rows = stmt.query([term])?;
+        let mut rows = stmt.query([identifier])?;
         if let Some(row) = rows.next()? {
             let mut link = super::Link {
                 id: row.get(0)?,
                 url: row.get(1)?,
-                title: Some(row.get::<_, String>(2)?),
-                description: Some(row.get::<_, String>(3)?),
+                title: row.get::<_, Option<String>>(2)?,
+                description: row.get::<_, Option<String>>(3)?,
                 content: None,
                 is_primary: row.get(4)?,
                 created_at: row.get::<_, String>(5)?.parse()?,
@@ -736,14 +803,32 @@ mod db {
     }
 
     pub fn delete_link(tx: &Transaction, link_id: &TableId) -> Result<()> {
-        // Our foreign key cascades will clean up related links, associated
-        // notes, and tags -- a possible improvement would be to remove orphaned
-        // tags after this is applied.
-        let delete_query = "DELETE FROM link WHERE id = ?";
+        // If the link is a primary link but also serves as a related link,
+        // we want to make it is_primary FALSE and also drop related links,
+        // associated notes, and tags; in the normal course of things, however,
+        // our foreign key cascades will clean them up.
+        //
+        // A possible improvement would be to check here and remove orphaned
+        // tags.
+        let delete_query = "DELETE FROM link WHERE id = ? AND is_primary = true";
         tx.execute(delete_query, [&link_id])?;
         Ok(())
     }
 
+    pub fn get_inverse_related_links(tx: &Transaction, link_id: &TableId) -> Result<Vec<TableId>> {
+        let select = "SELECT primary_link_id
+                FROM related_link
+                WHERE related_link_id = ?";
+        let mut stmt = tx.prepare(select)?;
+        let mut rows = stmt.query([link_id])?;
+        let mut resp: Vec<TableId> = vec![];
+        while let Some(row) = rows.next()? {
+            resp.push(row.get(0)?);
+        }
+        Ok(resp)
+    }
+
+    #[derive(Debug)]
     pub struct LinkInsert<'a> {
         pub url: &'a str,
         pub title: Option<&'a str>,
@@ -755,7 +840,7 @@ mod db {
 
     pub fn insert_link(
         tx: &Transaction,
-        link: LinkInsert,
+        link: &LinkInsert,
         ignore_conflict: bool,
     ) -> Result<TableId> {
         let id = get_uuid();
@@ -793,16 +878,32 @@ mod db {
         };
         // Now, insert the content into the full-text index.
         if let Ok(row_id) = row_result {
-            let ft_query = "INSERT INTO link_content(link_id, content)
-            VALUES (:id, :content)";
-            let mut ft_stmt = tx.prepare(ft_query)?;
-            let ft_values = named_params! {
-                ":id": row_id,
-                ":content": link.content,
-            };
-            let _ = ft_stmt.query(ft_values)?;
+            if let Some(content) = link.content {
+                insert_content(tx, &row_id, content)?;
+            }
         }
         row_result
+    }
+
+    pub fn update_link(tx: &Transaction, link: &super::Link) -> Result<Option<super::Link>> {
+        let values = named_params! {
+            ":id": link.id,
+            ":url": link.url,
+            ":title": link.title,
+            ":description": link.description,
+            ":is_primary": link.is_primary,
+            ":modified_at": super::now()?,
+        };
+        let query = "UPDATE link SET
+            url = :url,
+            title = :title,
+            description = :description,
+            is_primary = :is_primary,
+            modified_at = :modified_at
+            WHERE id = :id";
+        let mut stmt = tx.prepare(query)?;
+        stmt.execute(values)?;
+        get_link(tx, TermOrId::Id(link.id), IsPrimary::Either)
     }
 
     pub fn tag_link(tx: &Transaction, link_id: TableId, tag_id: TableId) -> Result<()> {
@@ -860,12 +961,62 @@ mod db {
         Ok(resp)
     }
 
+    pub fn delete_related_links(
+        tx: &Transaction,
+        primary_link_id: Option<&TableId>,
+        related_link_id: Option<&TableId>,
+    ) -> Result<()> {
+        if primary_link_id.is_none() && related_link_id.is_none() {
+            Err(anyhow!("Primary or related link ID required"))
+        } else {
+            let query_base = "DELETE FROM related_link
+                WHERE";
+            let mut query_vec = vec![];
+            let mut vals_vec = vec![];
+            if let Some(primary_link) = primary_link_id {
+                query_vec.push("\t\t\tprimary_link_id = ?");
+                vals_vec.push(primary_link);
+            }
+            if let Some(related_link) = related_link_id {
+                query_vec.push("\t\t\trelated_link_id = ?");
+                vals_vec.push(related_link);
+            }
+            let query = format!("{} {}", query_base, query_vec.join("\t\t\tAND"));
+            let mut stmt = tx.prepare(&query)?;
+            stmt.execute(params_from_iter(vals_vec.iter()))?;
+            Ok(())
+        }
+    }
+
+    pub fn insert_content(tx: &Transaction, link_id: &TableId, content: &str) -> Result<()> {
+        let ft_query = "INSERT INTO link_content(link_id, content)
+            VALUES (:id, :content)";
+        let mut ft_stmt = tx.prepare(ft_query)?;
+        let ft_values = named_params! {
+            ":id": link_id,
+            ":content": content,
+        };
+        ft_stmt.execute(ft_values)?;
+        Ok(())
+    }
+
+    pub fn delete_content(tx: &Transaction, link_id: &TableId) -> Result<()> {
+        let ft_query = "DELETE FROM link_content
+            WHERE link_id = :id";
+        let mut ft_stmt = tx.prepare(ft_query)?;
+        let ft_values = named_params! {
+            ":id": link_id,
+        };
+        ft_stmt.execute(ft_values)?;
+        Ok(())
+    }
+
     // TAGS
     pub fn tags_for_item(tx: &Transaction, item_id: &TableId) -> Result<Vec<super::Tag>> {
         let query = "SELECT DISTINCT id, slug, name, created_at, modified_at
             FROM tag
             WHERE id IN (
-                SELECT tag_id from item_tag
+                SELECT tag_id FROM item_tag
                 WHERE note_id = ?1 OR link_id = ?2
             ) ORDER BY slug";
         let mut stmt = tx.prepare(query)?;
@@ -909,6 +1060,13 @@ mod db {
         } else {
             Err(anyhow!("Unable to insert or load tag `{}`", slug))
         }
+    }
+
+    pub fn delete_item_tags(tx: &Transaction, item_id: &TableId) -> Result<()> {
+        let query = "DELETE FROM item_tag WHERE note_id = ?1 OR link_id = ?2";
+        let mut stmt = tx.prepare(query)?;
+        stmt.execute([&item_id, &item_id])?;
+        Ok(())
     }
 
     // NOTES
