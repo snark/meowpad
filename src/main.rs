@@ -171,6 +171,46 @@ struct ShowArgs {
     format: ListOutputFormat,
 }
 
+#[derive(Parser, Debug)]
+struct UpdateArgs {
+    /// The link to update
+    link: String,
+    // Subcommand
+    #[command(subcommand)]
+    command: UpdateCommands,
+}
+
+#[derive(Parser, Debug)]
+struct UpdateAddRelatedLinkArgs {
+    /// The new related link
+    related_link: String,
+    #[arg(long, requires = "related_link")]
+    relation: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct UpdateAddTagArgs {
+    /// The tag or tags to add
+    #[arg(num_args = 1..)]
+    tags: Vec<String>,
+}
+
+#[derive(Parser, Debug)]
+struct UpdateRefreshArgs {}
+
+#[derive(Parser, Debug)]
+struct UpdateRemoveRelatedLinkArgs {
+    /// The related link to remove
+    related_link: String,
+}
+
+#[derive(Parser, Debug)]
+struct UpdateRemoveTagArgs {
+    /// The tag or tags to add
+    #[arg(num_args = 1..)]
+    tags: Vec<String>,
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Add a link
@@ -205,6 +245,39 @@ enum Commands {
         #[clap(flatten)]
         show_args: ShowArgs,
     },
+    /// Update an existing link
+    Update {
+        #[clap(flatten)]
+        update_args: UpdateArgs,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum UpdateCommands {
+    Refresh {
+        #[clap(flatten)]
+        refresh_args: UpdateRefreshArgs,
+    },
+    #[clap(alias = "add-related")]
+    AddRelatedLink {
+        #[clap(flatten)]
+        add_related_link_args: UpdateAddRelatedLinkArgs,
+    },
+    #[clap(alias = "add-tags")]
+    AddTag {
+        #[clap(flatten)]
+        add_tag_args: UpdateAddTagArgs,
+    },
+    #[clap(alias = "remove-related")]
+    RemoveRelatedLink {
+        #[clap(flatten)]
+        remove_related_link_args: UpdateRemoveRelatedLinkArgs,
+    },
+    #[clap(alias = "remove-tags")]
+    RemoveTag {
+        #[clap(flatten)]
+        remove_tag_args: UpdateRemoveTagArgs,
+    },
 }
 
 fn main() -> Result<()> {
@@ -223,42 +296,75 @@ fn main() -> Result<()> {
     db_migrations::migrate(conn)
         .with_context(|| format!("Unable to upgrade database at {:?}", &config.database))?;
 
+    let mut conn = Connection::open(&config.database)?;
+    let tx = conn.transaction()?;
+
     match &cli.command {
         Commands::Add { add_args } => {
-            let mut conn = Connection::open(&config.database)?;
-            let tx = conn.transaction()?;
             add_cmd(&tx, add_args).with_context(|| format!("Unable to add <{}>", add_args.link))?;
             tx.commit()?;
         }
         Commands::List { list_args } => {
-            let mut conn = Connection::open(&config.database)?;
-            let tx = conn.transaction()?;
             list_cmd(&tx, list_args).with_context(|| "Unable to list items")?;
         }
         Commands::Note { note_args } => {
-            let mut conn = Connection::open(&config.database)?;
-            let tx = conn.transaction()?;
             note_cmd(&tx, note_args).with_context(|| "Unable to add note")?;
             tx.commit()?;
         }
         Commands::Remove { remove_args } => {
-            let mut conn = Connection::open(&config.database)?;
-            let tx = conn.transaction()?;
             remove_cmd(&tx, remove_args).with_context(|| "Unable to remove item")?;
             tx.commit()?;
         }
         Commands::Search { search_args } => {
-            let mut conn = Connection::open(&config.database)?;
-            let tx = conn.transaction()?;
             search_cmd(&tx, search_args).with_context(|| "Unable to search")?;
         }
         Commands::Show { show_args } => {
-            let mut conn = Connection::open(&config.database)?;
-            let tx = conn.transaction()?;
             show_cmd(&tx, show_args)
                 .with_context(|| format!("Unable to show <{}>", show_args.term))?;
         }
+        Commands::Update { update_args } => {
+            let link = db::get_link(
+                &tx,
+                db::TermOrId::Term(&update_args.link),
+                db::IsPrimary::PrimaryOnly,
+            )?;
+            if let Some(link) = link {
+                let command = match &update_args.command {
+                    UpdateCommands::AddRelatedLink {
+                        add_related_link_args,
+                    } => update_add_related_link_cmd(
+                        &tx,
+                        &link,
+                        &add_related_link_args.related_link,
+                        &add_related_link_args.relation,
+                    ),
+                    UpdateCommands::AddTag { add_tag_args } => {
+                        update_add_tag_cmd(&tx, &link, &add_tag_args.tags)
+                    }
+                    UpdateCommands::Refresh { refresh_args: _ } => {
+                        let mut writeable = link.clone();
+                        update_refresh_cmd(&tx, &mut writeable)
+                    }
+                    UpdateCommands::RemoveRelatedLink {
+                        remove_related_link_args,
+                    } => update_remove_related_link_cmd(
+                        &tx,
+                        &link,
+                        &remove_related_link_args.related_link,
+                    ),
+                    UpdateCommands::RemoveTag { remove_tag_args } => {
+                        update_remove_tag_cmd(&tx, &link, &remove_tag_args.tags)
+                    }
+                };
+                command.with_context(|| format!("Unable to update <{}>", &update_args.link))?;
+                tx.commit()?;
+                println!("<{}> updated", update_args.link);
+            } else {
+                println!("Unknown link <{}>", update_args.link);
+            }
+        }
     }
+
     Ok(())
 }
 
@@ -665,6 +771,93 @@ fn show_cmd(tx: &Transaction, args: &ShowArgs) -> Result<()> {
     Ok(())
 }
 
+fn update_add_related_link_cmd(
+    tx: &Transaction,
+    link: &Link,
+    related_link: &String,
+    link_relation: &Option<String>,
+) -> Result<()> {
+    let now = now()?;
+    let insert_vals = db::LinkInsert {
+        url: related_link,
+        title: None,
+        description: None,
+        content: None,
+        is_primary: false,
+        timestamp: &now,
+    };
+    let related_link_id = db::insert_link(tx, &insert_vals, true)?;
+    // TODO: Add a better error message for a duplicate related link.
+    db::relate_links(tx, link.id, related_link_id, link_relation.as_deref())?;
+    Ok(())
+}
+
+fn update_add_tag_cmd(tx: &Transaction, link: &Link, tags: &Vec<String>) -> Result<()> {
+    for tag_name in tags {
+        let tag_id = get_tag_id(tx, tag_name)?;
+        db::tag_link(tx, link.id, tag_id)?;
+    }
+    Ok(())
+}
+
+fn update_refresh_cmd(tx: &Transaction, link: &mut Link) -> Result<()> {
+    let page_info = readability(link.url.as_ref())?;
+    // TODO: We should eventually support user override for title and
+    // description here.
+    let title: Option<String> = if page_info.title.is_empty() {
+        None
+    } else {
+        Some(page_info.title)
+    };
+    let description = page_info.excerpt;
+    let text_content = page_info.text_content.trim();
+
+    link.title = title;
+    link.description = description;
+    link.content = Some(text_content.to_string());
+
+    db::update_link(tx, &link)?;
+
+    Ok(())
+}
+
+fn update_remove_related_link_cmd(
+    tx: &Transaction,
+    link: &Link,
+    related_link_url: &String,
+) -> Result<()> {
+    let related_link = db::get_link(
+        tx,
+        db::TermOrId::Term(related_link_url.as_str()),
+        db::IsPrimary::Either,
+    )?;
+    if let Some(related_link) = related_link {
+        db::delete_related_links(tx, Some(&link.id), Some(&related_link.id))?;
+        remove_orphaned_related_link(tx, &related_link)?;
+    } else {
+        println!("<{}> is not related to <{}>", related_link_url, link.url);
+    }
+    Ok(())
+}
+
+fn remove_orphaned_related_link(tx: &Transaction, related_link: &Link) -> Result<()> {
+    // Cleanup function: if we've just removed a related link from a link item,
+    // let's drop the related link from the links table if nothing else references
+    // it.
+    if !related_link.is_primary {
+        db::delete_orphaned_related_link(tx, &related_link.id)?;
+    }
+    Ok(())
+}
+
+fn update_remove_tag_cmd(tx: &Transaction, link: &Link, tags: &Vec<String>) -> Result<()> {
+    for tag_name in tags {
+        let tag_id = get_tag_id(tx, tag_name)?;
+        db::delete_item_tag(tx, &link.id, &tag_id)?;
+    }
+    Ok(())
+}
+
 mod db {
     use anyhow::{anyhow, Result};
     use rusqlite::{named_params, params_from_iter, ToSql, Transaction};
@@ -949,8 +1142,8 @@ mod db {
         let query = "SELECT
             url, related_link.relationship
             FROM link JOIN related_link
-            ON link.id = related_link.primary_link_id
-            WHERE id = ?
+            ON link.id = related_link.related_link_id
+            WHERE related_link.primary_link_id = ?
             ";
         let mut stmt = tx.prepare(query)?;
         let mut rows = stmt.query([&primary_id])?;
@@ -959,6 +1152,17 @@ mod db {
             resp.push((row.get(0)?, row.get(1)?));
         }
         Ok(resp)
+    }
+
+    pub fn delete_orphaned_related_link(tx: &Transaction, related_link_id: &TableId) -> Result<()> {
+        let query = "DELETE FROM link
+            WHERE id = ?
+            AND (
+                SELECT COUNT(1) FROM related_link
+                WHERE related_link_id = ?
+            ) = 0";
+        tx.execute(query, [&related_link_id, &related_link_id])?;
+        Ok(())
     }
 
     pub fn delete_related_links(
@@ -1066,6 +1270,15 @@ mod db {
         let query = "DELETE FROM item_tag WHERE note_id = ?1 OR link_id = ?2";
         let mut stmt = tx.prepare(query)?;
         stmt.execute([&item_id, &item_id])?;
+        Ok(())
+    }
+
+    pub fn delete_item_tag(tx: &Transaction, item_id: &TableId, tag_id: &TableId) -> Result<()> {
+        let query = "DELETE FROM item_tag
+            WHERE (note_id = ?1 OR link_id = ?2)
+            AND tag_id = ?3";
+        let mut stmt = tx.prepare(query)?;
+        stmt.execute([item_id, item_id, tag_id])?;
         Ok(())
     }
 
